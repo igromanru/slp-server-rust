@@ -6,22 +6,13 @@ use graphql::{schema, Context};
 use slp::UDPServer;
 use std::net::SocketAddr;
 use warp::Filter;
-use serde::Serialize;
 use std::convert::Infallible;
 use graphql_ws_filter::make_graphql_ws_filter;
 use warp::filters::BoxedFilter;
 
-#[derive(Serialize)]
-struct Info {
-    online: i32,
-    version: String,
-}
 
 async fn server_info(context: Context) -> Result<impl warp::Reply, Infallible> {
-    Ok(warp::reply::json(&Info {
-        online: context.udp_server.online().await,
-        version: std::env!("CARGO_PKG_VERSION").to_owned(),
-    }))
+    Ok(warp::reply::json(&context.udp_server.server_info().await))
 }
 
 fn make_state(udp_server: &UDPServer) -> BoxedFilter<(Context,)> {

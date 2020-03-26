@@ -1,11 +1,24 @@
 use tokio::io::Result;
 use tokio::net::{UdpSocket, udp::RecvHalf};
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{RwLock, mpsc, broadcast};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use lru::LruCache;
 use tokio::time::{Instant, timeout_at};
+use serde::Serialize;
+use juniper::{GraphQLObject, FieldError};
+use futures::{stream::{StreamExt, BoxStream}, future};
+use crate::graphql::FilterSameExt;
+
+/// Infomation about this server
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, GraphQLObject)]
+pub struct ServerInfo {
+    /// The number of online clients
+    online: i32,
+    /// The version of the server
+    version: String,
+}
 
 struct PeerInner {
     rx: mpsc::Receiver<Vec<u8>>,
@@ -65,11 +78,18 @@ impl InnerServer {
             cache: LruCache::new(100),
         }
     }
+    fn server_info(&self) -> ServerInfo {
+        ServerInfo {
+            online: self.cache.len() as i32,
+            version: std::env!("CARGO_PKG_VERSION").to_owned(),
+        }
+    }
 }
 
 #[derive(Clone)]
 pub struct UDPServer {
     inner: Arc<RwLock<InnerServer>>,
+    info_stream: broadcast::Sender<ServerInfo>,
 }
 
 type Packet = (SocketAddr, Vec<u8>);
@@ -78,6 +98,7 @@ impl UDPServer {
         let inner = Arc::new(RwLock::new(InnerServer::new()));
         let inner2 = inner.clone();
         let inner3 = inner.clone();
+        let inner4 = inner.clone();
         let (tx, rx) = mpsc::channel::<Packet>(10);
         let (event_send, mut event_recv) = mpsc::channel::<Event>(1);
         let (recv_half, mut send_half) = UdpSocket::bind(addr).await?.split();
@@ -114,8 +135,33 @@ impl UDPServer {
             }
         });
 
+        let (info_stream, rx) = broadcast::channel(10);
+        let info_sender = info_stream.clone();
+        tokio::spawn(async move {
+            rx;
+            tokio::time::interval(
+                Duration::from_secs(1)
+            )
+            .then(move |_| {
+                let inner = inner4.clone();
+                async move {
+                    let inner = inner.read().await;
+                    inner.server_info()
+                }
+            })
+            .filter_same()
+            .map(|info| {
+                let info_sender = info_sender.clone();
+                info_sender.send(info.clone()).is_ok()
+            })
+            .take_while(|ok| future::ready(*ok))
+            .for_each(|_| future::ready(()))
+            .await;
+        });
+
         Ok(Self {
             inner,
+            info_stream,
         })
     }
     async fn on_packet(mut receiver: mpsc::Receiver<Packet>, inner: Arc<RwLock<InnerServer>>, event_send: mpsc::Sender<Event>) -> Result<()> {
@@ -140,7 +186,19 @@ impl UDPServer {
             sender.send((addr, buffer)).await.unwrap();
         }
     }
-    pub async fn online(&self) -> i32 {
-        self.inner.read().await.cache.len() as i32
+    pub async fn server_info(&self) -> ServerInfo {
+        let inner = self.inner.read().await;
+
+        inner.server_info()
+    }
+    pub fn server_info_stream(&self) -> BoxStream<'static, std::result::Result<ServerInfo, FieldError>> {
+        self.info_stream.subscribe()
+        .map(|info| {
+            info.map_err(|err| FieldError::new(
+                "Failed to recv",
+                juniper::Value::null()
+            ))
+        })
+        .boxed()
     }
 }
