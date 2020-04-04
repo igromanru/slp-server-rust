@@ -1,21 +1,45 @@
 use tokio::sync::mpsc;
 use std::net::SocketAddr;
 use std::time::Duration;
-use tokio::time::{Instant, timeout_at};
-use super::{Event, SendLANEvent, log_err, log_warn};
+use tokio::time::{Instant, timeout};
+use super::{Event, SendLANEvent, log_err, Packet};
 use super::frame::{ForwarderFrame, Parser};
 
+const IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+#[derive(Debug, PartialEq)]
+pub enum PeerState {
+    Connected(Instant),
+    Idle,
+}
+
+impl PeerState {
+    pub fn is_connected(&self) -> bool {
+        match self {
+            &PeerState::Connected(_) => true,
+            _ => false,
+        }
+    }
+    pub fn is_idle(&self) -> bool {
+        match self {
+            &PeerState::Idle => true,
+            _ => false,
+        }
+    }
+}
+
 struct PeerInner {
-    rx: mpsc::Receiver<Vec<u8>>,
+    rx: mpsc::Receiver<Packet>,
     addr: SocketAddr,
     event_send: mpsc::Sender<Event>,
 }
 pub struct Peer {
-    sender: mpsc::Sender<Vec<u8>>,
+    sender: mpsc::Sender<Packet>,
+    pub(super) state: PeerState,
 }
 impl Peer {
     pub fn new(addr: SocketAddr, event_send: mpsc::Sender<Event>) -> Self {
-        let (tx, rx) = mpsc::channel::<Vec<u8>>(10);
+        let (tx, rx) = mpsc::channel::<Packet>(10);
         tokio::spawn(async move {
             let mut exit_send = event_send.clone();
             let _ = Self::do_packet(PeerInner {
@@ -27,19 +51,36 @@ impl Peer {
         });
         Self {
             sender: tx,
+            state: PeerState::Idle,
         }
     }
-    pub fn on_packet(&self, data: Vec<u8>) {
-        log_warn(
-            self.sender.clone().try_send(data),
-            "failed to send packet"
-        )
+    pub fn on_packet(&mut self, data: Packet) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let frame = ForwarderFrame::parse(&data)?;
+        let now = Instant::now();
+        let state = match (frame, &self.state) {
+            (ForwarderFrame::Ipv4(..), _) | (ForwarderFrame::Ipv4Frag(..), _) => {
+                Some(PeerState::Connected(now))
+            },
+            (_, PeerState::Connected(last_time)) if now.duration_since(*last_time) < IDLE_TIMEOUT => {
+                None
+            },
+            (_, PeerState::Connected(_)) => {
+                Some(PeerState::Idle)
+            },
+            _ => {
+                None
+            },
+        };
+        if let Some(state) = state {
+            self.state = state;
+        }
+
+        Ok(self.sender.clone().try_send(data)?)
     }
     async fn do_packet(inner: PeerInner) -> std::result::Result<(), Box<dyn std::error::Error>> {
         let PeerInner { mut rx, addr, mut event_send } = inner;
         loop {
-            let deadline = Instant::now() + Duration::from_secs(30);
-            let packet = match timeout_at(deadline, rx.recv()).await {
+            let packet = match timeout(Duration::from_secs(30), rx.recv()).await {
                 Ok(Some(packet)) => packet,
                 _ => {
                     log::debug!("Timeout {}", addr);
@@ -48,23 +89,24 @@ impl Peer {
             };
 
             let frame = ForwarderFrame::parse(&packet)?;
+
             match frame {
                 ForwarderFrame::Keepalive => {},
                 ForwarderFrame::Ipv4(ipv4) => {
-                    event_send.try_send(Event::SendLAN(SendLANEvent{
+                    event_send.send(Event::SendLAN(SendLANEvent{
                         from: addr,
                         src_ip: ipv4.src_ip(),
                         dst_ip: ipv4.dst_ip(),
                         packet,
-                    }))?
+                    })).await?;
                 },
                 ForwarderFrame::Ipv4Frag(frag) => {
-                    event_send.try_send(Event::SendLAN(SendLANEvent{
+                    event_send.send(Event::SendLAN(SendLANEvent{
                         from: addr,
                         src_ip: frag.src_ip(),
                         dst_ip: frag.dst_ip(),
                         packet,
-                    }))?
+                    })).await?;
                 },
                 _ => (),
             }
