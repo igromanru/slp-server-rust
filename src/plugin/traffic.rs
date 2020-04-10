@@ -15,6 +15,10 @@ pub struct TrafficInfo {
     upload: i32,
     /// download bytes last second
     download: i32,
+    /// upload packets last second
+    upload_packet: i32,
+    /// download packets last second
+    download_packet: i32,
 }
 type TrafficInfoStream = BoxStream<'static, TrafficInfo>;
 
@@ -23,13 +27,17 @@ impl TrafficInfo {
         Self {
             upload: 0,
             download: 0,
+            upload_packet: 0,
+            download_packet: 0,
         }
     }
     fn upload(&mut self, size: i32) {
-        self.upload += size
+        self.upload += size;
+        self.upload_packet += 1;
     }
     fn download(&mut self, size: i32) {
-        self.download += size
+        self.download += size;
+        self.download_packet += 1;
     }
 }
 
@@ -48,8 +56,8 @@ impl Inner {
     async fn in_packet(&mut self, packet: &InPacket) {
         self.0.lock().await.0.download(packet.as_ref().len() as i32)
     }
-    async fn out_packet(&mut self, packet: &OutPacket) {
-        self.0.lock().await.0.upload(packet.as_ref().len() as i32)
+    async fn out_packet(&mut self, packet: &Packet, addrs: &[SocketAddr]) {
+        self.0.lock().await.0.upload((packet.len() * addrs.len()) as i32)
     }
     async fn traffic_info(&self) -> TrafficInfo {
         self.0.lock().await.0.clone()
@@ -90,8 +98,8 @@ impl Plugin for Traffic {
     async fn in_packet(&mut self, packet: &InPacket) {
         self.0.in_packet(packet).await
     }
-    async fn out_packet(&mut self, packet: &OutPacket) {
-        self.0.out_packet(packet).await
+    async fn out_packet(&mut self, packet: &Packet, addrs: &[SocketAddr]) {
+        self.0.out_packet(packet, addrs).await
     }
 }
 
